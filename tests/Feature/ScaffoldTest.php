@@ -28,3 +28,22 @@ it('registers the dedicated control-plane and read-only connections', function (
 it('registers the ip-allowlist middleware alias', function () {
     expect(app('router')->getMiddleware())->toHaveKey('mcp.ip-allowlist');
 });
+
+it('registers the channel-B operator middleware alias', function () {
+    expect(app('router')->getMiddleware())->toHaveKey('mcp.operator');
+});
+
+it('ships channel-B OAuth defaults that are inert until enabled', function () {
+    // Redirect allowlist is pre-pointed at the claude.ai callbacks.
+    expect(config('mcp.oauth.redirect_allowlist'))
+        ->toContain('https://claude.ai/api/mcp/auth_callback');
+
+    // The package manages Passport for channel B by default, but only kicks in
+    // once http.enabled is on (which it is not, by default).
+    expect(config('mcp.oauth.manage_passport'))->toBeTrue();
+    expect(config('mcp.http.enabled'))->toBeFalse();
+});
+
+it('ships the namespaced consent view', function () {
+    expect(view()->exists('mcp::oauth-consent'))->toBeTrue();
+});

@@ -52,6 +52,13 @@ MCP_HTTP_ENABLED=false
 MCP_HTTP_DOMAIN=mcp.example.com
 MCP_ROUTE_PREFIX=mcp
 
+# Channel B OAuth — service account (token `sub`) + operator hook
+MCP_OAUTH_ACCOUNT=diag                 # provisioned via mcp:account:create
+MCP_OAUTH_OPERATOR_GUARD=web           # guard holding the human operator
+MCP_OAUTH_OPERATOR_GATE=mcp-operator   # Gate ability; or set mcp.oauth.operator_check in config
+MCP_OAUTH_OPERATOR_LOGIN_ROUTE=login   # where to bounce an unauthenticated operator
+# MCP_OAUTH_REDIRECT_ALLOWLIST defaults to the claude.ai/claude.com callbacks
+
 # IP allowlist — on by default, local only
 MCP_IP_ALLOWLIST_ENABLED=true
 MCP_IP_ALLOWLIST=127.0.0.1,::1
@@ -67,6 +74,65 @@ php artisan mcp:install
 `mcp:install` publishes config + migrations, runs the migrations, and prints the manual steps
 (the `mcp` auth guard for `config/auth.php` and the `routes/ai.php` entries) — these are printed
 rather than auto-applied, because those files differ per project and version.
+
+### Channel A (Claude Code, Bearer) — the primary path
+
+Beyond `composer require` + `mcp:install`, six steps get channel A live. `mcp:install` prints the
+first two verbatim:
+
+1. **`config/auth.php`** — add the `mcp` guard (Passport driver) + `mcp_service` provider
+   (`McpServiceAccount`). Existing guards stay untouched.
+2. **`routes/ai.php`** — `Mcp::local('diagnostics', DiagnosticsServer::class)`.
+3. **Three MySQL accounts + grants** — `php artisan mcp:grants:print` emits the exact `GRANT`
+   statements; **a DBA runs them** (the package never provisions DB users). This is where read-only
+   is actually enforced (`mcp_ro` is SELECT-only at the DB level).
+4. **`php artisan passport:install`** — keys + personal access client (required for Bearer tokens).
+5. **Account → grant → token:** `mcp:account:create <name>` → `mcp:account:grant <name> read` →
+   `mcp:token:issue <name>` (the token is shown once).
+6. **Review masking against the project schema** — patterns match by column name and are best-effort:
+   a bare `name`/`city` or an unlabelled person column (`applicant`) is **not** auto-masked. Extend
+   `masking.patterns` / `masking.allowlist` per database before exposing data. Re-do this for every
+   new project — a different schema means different PII.
+
+### Channel B (claude.ai, OAuth 2.1 + PKCE)
+
+> **PREREQUISITE — Passport must be dedicated to MCP in this app.** Channel B configures Passport
+> **globally**, so enabling it in an app that also uses Passport for its own OAuth will disrupt that
+> OAuth. Concretely, with `http.enabled` + `manage_passport` (default on) the package sets: **(1)**
+> the consent view — bound as a callback so only MCP connectors (redirect on the allowlist) get the
+> MCP screen and other clients keep the default `passport::authorize`; **(2)** global token lifetimes
+> (1d / 30d / 90d) for **all** Passport tokens; and you must set **(3)** `passport.guard = mcp_web`
+> globally, which changes the OAuth resource owner for the whole app. If Passport is shared, either
+> separate the concerns first or set `mcp.oauth.manage_passport=false` and wire Passport yourself.
+
+`php artisan mcp:install --with-oauth` scaffolds channel B: it publishes the consent view and prints
+the wiring. The package ships the whole operator-authorization layer — an operator middleware, the
+consent screen, the redirect allowlist and the Passport bootstrap — so you only wire it up and fill
+**one** project-specific hook.
+
+1. **`config/auth.php`** — add a `mcp_web` **session** guard (over `mcp_service`) so the minted token's
+   `sub` is the service account, not the human operator.
+2. **`config/passport.php`** — `'guard' => 'mcp_web'` **only if Passport is used solely for MCP** in
+   this app (it's a global setting; an app using Passport for other things must keep them separate).
+3. **`bootstrap/app.php`** — append the operator gate to the `web` group:
+   `$middleware->web(append: [\Decocode\LaravelMcp\Http\Middleware\EnsureMcpOperator::class])`.
+4. **Answer "who may authorize a connector"** — the one project-specific edit:
+   - **Gate ability** (simple): `Gate::define('mcp-operator', fn ($u) => $u->hasRole('Super Admin'))`,
+     then `mcp.oauth.operator_gate = 'mcp-operator'` (+ `operator_guard`, `operator_login_route`).
+   - **`McpOperatorCheck` class** (advanced): set `mcp.oauth.operator_check` to a class implementing
+     `authorize(Request): bool` + `serviceAccountId(): ?int` — wins over the gate; use it for logic a
+     Gate can't express or a dynamically chosen service account.
+5. **`MCP_HTTP_ENABLED=true`** + a public HTTPS endpoint (a dedicated domain or a tunnel), and point
+   `mcp.oauth.account` at the provisioned service account.
+
+The consent screen is **always shown — never auto-approved.** Client registration is public + dynamic,
+so a silent approve would let one phished operator click authorize an attacker's client; the redirect
+allowlist pins the delivery channel (claude.ai), the consent click pins the recipient. The package
+applies this Passport bootstrap automatically when channel B is on (opt out with
+`mcp.oauth.manage_passport=false`). Make your own RODO/GDPR decisions on what to mask.
+
+> Channel A is repeatable and mostly config. Channel B adds the wiring above — five steps, one of them
+> the operator hook.
 
 ## Security model (summary)
 

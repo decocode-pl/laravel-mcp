@@ -208,6 +208,58 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Channel B — claude.ai OAuth (operator gate + consent)
+    |--------------------------------------------------------------------------
+    | claude.ai connects via full OAuth 2.1 + PKCE. The package ships the whole
+    | operator-authorization layer (the `mcp.operator` middleware + consent view
+    | + Passport bootstrap); a project only wires it up and fills ONE hook —
+    | "who may authorize a connector". Two ways to answer that:
+    |
+    |   • operator_gate  — a Gate ability checked against the operator guard's
+    |     user (the simple, idiomatic path). Define it in a service provider:
+    |         Gate::define('mcp-operator', fn ($u) => $u->hasRole('Super Admin'));
+    |
+    |   • operator_check — a class implementing Contracts\McpOperatorCheck
+    |     (authorize(Request): bool + serviceAccountId(): ?int). Takes precedence
+    |     over the gate when set; use it for logic a Gate can't express, or to
+    |     pick the service account dynamically.
+    |
+    | Everything here is inert until channel B is enabled (`http.enabled`).
+    */
+    'oauth' => [
+        // Service account whose id becomes the issued token's `sub` (resource
+        // owner). Provision it with `mcp:account:create <name>` + grant `read`.
+        'account' => env('MCP_OAUTH_ACCOUNT'),
+
+        // Only these redirect_uri values may receive an authorization code —
+        // client registration is public, so this pins the delivery channel to
+        // claude.ai. (The always-on consent screen pins the recipient.)
+        'redirect_allowlist' => array_values(array_filter(array_map('trim', explode(',', (string) env(
+            'MCP_OAUTH_REDIRECT_ALLOWLIST',
+            'https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback'
+        ))))),
+
+        // Operator hook (see block above). operator_check wins over operator_gate.
+        'operator_guard' => env('MCP_OAUTH_OPERATOR_GUARD', 'web'),
+        'operator_gate' => env('MCP_OAUTH_OPERATOR_GATE'),       // e.g. 'mcp-operator'
+        'operator_check' => null,                                // e.g. App\Mcp\SuperAdminOperator::class
+        'operator_login_route' => env('MCP_OAUTH_OPERATOR_LOGIN_ROUTE', 'login'),
+
+        // Session guard the service account is logged into as the OAuth resource
+        // owner. Register it in config/auth.php (see `mcp:install --with-oauth`).
+        'web_guard' => env('MCP_OAUTH_WEB_GUARD', 'mcp_web'),
+
+        // Let the package configure Passport for channel B (consent view + short
+        // token lifetimes + never auto-approve). Turn OFF if your app already
+        // manages Passport itself and you want full control.
+        'manage_passport' => (bool) env('MCP_OAUTH_MANAGE_PASSPORT', true),
+        'token_ttl_days' => (int) env('MCP_OAUTH_TOKEN_TTL_DAYS', 1),
+        'refresh_ttl_days' => (int) env('MCP_OAUTH_REFRESH_TTL_DAYS', 30),
+        'personal_ttl_days' => (int) env('MCP_OAUTH_PERSONAL_TTL_DAYS', 90),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Audit log (control-plane)
     |--------------------------------------------------------------------------
     */

@@ -3,6 +3,41 @@
 All notable changes to `decocode/laravel-mcp` are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-07-05
+
+### Added — channel B (claude.ai OAuth) scaffolding
+- The operator-authorization layer for claude.ai connectors now ships with the package, so a project
+  no longer hand-writes it. Previously channel B required app-side glue (an operator middleware, a
+  consent view, a redirect allowlist, Passport bootstrap); those are now built in.
+- **`EnsureMcpOperator` middleware** (alias `mcp.operator`) guards `/oauth/authorize`: it authorizes
+  the operator, enforces the `redirect_uri` allowlist, and logs the read-only service account in as the
+  OAuth resource owner (its id becomes the token `sub`). Register it in the `web` group.
+- **"Who may authorize a connector"** is the one project-specific decision, answered two ways: a Gate
+  ability (`mcp.oauth.operator_gate`, the simple path) or an `McpOperatorCheck` class
+  (`mcp.oauth.operator_check`, which wins when set — for logic a Gate can't express or a dynamically
+  chosen service account).
+- **Consent view** (`mcp::oauth-consent`) is shipped and shown by default — always, never auto-approved
+  (public + dynamic client registration makes a silent approve a phishing vector). Override via
+  `php artisan vendor:publish --tag=mcp-oauth-views`.
+- **Passport bootstrap** for channel B (consent view binding + short token lifetimes) is applied
+  automatically when `http.enabled` is on; opt out with `mcp.oauth.manage_passport=false` if the app
+  manages Passport itself.
+- **`mcp:install --with-oauth`** publishes the consent view and prints the channel-B wiring (the
+  `mcp_web` session guard, the operator middleware, and the operator hook).
+- New config block `mcp.oauth.*` (account, redirect allowlist, operator hook, web guard, token TTLs).
+  Backwards compatible: everything is inert unless channel B is enabled.
+
+### Security (channel B hardening)
+- **Consent is now enforced by the package, not assumed.** The operator middleware forces
+  `prompt=consent` on every authorize, so Passport cannot skip the screen via a persisted grant on
+  the shared service account (`skipsAuthorization` / `hasGrantedScopes`) — closing an auto-approve
+  path that a client reusing a stable `client_id` could otherwise exploit.
+- **The operator gate fails closed.** With neither `operator_gate` nor `operator_check` configured,
+  channel B refuses (403) instead of letting any authenticated user connect a connector.
+- **Consent view is scoped to MCP connectors.** Bound as a callback, so only clients whose redirect is
+  on the allowlist get the MCP screen; other Passport clients keep the default authorize view.
+- Revoked service accounts are treated as absent (never become an OAuth resource owner).
+
 ## [0.1.0] - 2026-07-04
 
 First public release.
