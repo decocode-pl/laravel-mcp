@@ -93,6 +93,17 @@ first two verbatim:
    a bare `name`/`city` or an unlabelled person column (`applicant`) is **not** auto-masked. Extend
    `masking.patterns` / `masking.allowlist` per database before exposing data. Re-do this for every
    new project — a different schema means different PII.
+   - **Run `php artisan mcp:masking:audit`** — a full-schema scan that lists PII-suspect columns that
+     are **not** masked, table by table. Reviewing masking against a diff or a hand-built list misses
+     gaps a full scan catches (legacy/foreign column names, a bare `ip`, `old`/`new` audit values);
+     make this part of the deployment's Definition of Done. Add `--strict` to fail CI on any gap or
+     any table it could not scan. The heuristic is **deliberately broad** — expect false positives to
+     dismiss, and treat an empty result as "no suspect column slipped the current config", **not**
+     proof of no PII. It fails (never green) on zero readable tables or an un-introspectable table.
+   - For a column that is PII in one table but a harmless label in another (`customers.name` vs
+     `tracks.name`), use **`masking.table_patterns`** (mask `table.column`) instead of a global
+     pattern; `masking.table_allowlist` un-masks a column in one table only. Keep `table_allowlist`
+     keys specific — a glob key (or a matching **view** name) lifts the mask across every match.
 
 ### Channel B (claude.ai, OAuth 2.1 + PKCE)
 
@@ -149,7 +160,11 @@ applies this Passport bootstrap automatically when channel B is on (opt out with
   `*address*` also masks FK columns (`address_id`) — allowlist the ones you need for joins.
   Verification timestamps (`email_verified_at`) are un-masked by default. Un-mask a field via
   `masking.allowlist`, or soften it via `masking.partial` (keyed by exact column name, e.g. a column
-  named `email` → domain).
+  named `email` → domain). **Table-qualified** rules (`masking.table_patterns` /
+  `masking.table_allowlist`) close the bare-`name` gap at the source — mask a column only in the
+  table(s) where it is PII — and apply wherever the tool knows the source table (`schema_describe`,
+  `count_rows`, `order_inspect`, and single-table `read_query` SELECTs; a JOIN result stays
+  name-based). Audit coverage with `php artisan mcp:masking:audit`.
 - **Capabilities** (`read` / `write` / `command:run`) are stored in `mcp_*` tables and managed via
   artisan commands — never in the repo.
 

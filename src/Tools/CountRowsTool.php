@@ -97,7 +97,9 @@ class CountRowsTool extends AbstractDiagnosticTool
             preg_match_all('/[a-z_][a-z0-9_]*/i', $whereScan, $identifiers);
 
             foreach (array_unique($identifiers[0]) as $identifier) {
-                if ($this->masker->shouldMask($identifier)) {
+                // Table-qualified (0.3.0): the counted table is known, so the
+                // oracle guard honours per-table masking too.
+                if ($this->masker->shouldMask($identifier, $table)) {
                     throw new QueryGuardException("The WHERE condition may not reference the masked column [{$identifier}].");
                 }
             }

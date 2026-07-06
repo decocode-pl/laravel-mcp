@@ -122,3 +122,75 @@ it('does not touch JSON columns when scrubbing is disabled', function () {
 
     expect($masker->maskRow(['payload' => $json])['payload'])->toBe($json);
 });
+
+// ---- Table-qualified masking (0.3.0) -------------------------------------
+
+it('masks a per-table column only within its table, leaving the same name elsewhere', function () {
+    // `name` is not a global pattern; table_patterns marks it PII in `customers`.
+    $masker = new ColumnMasker(
+        patterns: [], allowlist: [], partial: [], placeholder: '[masked]',
+        scrubJson: false,
+        tablePatterns: ['customers' => ['name']],
+    );
+
+    expect($masker->shouldMask('name', 'customers'))->toBeTrue();   // person
+    expect($masker->shouldMask('name', 'tracks'))->toBeFalse();     // entity label
+    expect($masker->shouldMask('name'))->toBeFalse();               // no table context → name-based only
+    expect($masker->maskRow(['name' => 'Jan'], 'customers'))->toBe(['name' => '[masked]']);
+    expect($masker->maskRow(['name' => 'Techno'], 'tracks'))->toBe(['name' => 'Techno']);
+});
+
+it('supports glob patterns on both the table and column side', function () {
+    $masker = new ColumnMasker(
+        patterns: [], allowlist: [], partial: [], placeholder: '[masked]',
+        scrubJson: false,
+        tablePatterns: ['*' => ['ip', 'ip_forwarded'], 'revisions' => ['old', 'new']],
+    );
+
+    expect($masker->shouldMask('ip', 'anything'))->toBeTrue();       // '*' table key
+    expect($masker->shouldMask('old', 'revisions'))->toBeTrue();
+    expect($masker->shouldMask('old', 'products'))->toBeFalse();
+});
+
+it('lets a table-scoped allowlist expose a globally-masked column in one table only', function () {
+    // Broad `*address*` masks address_id everywhere; expose it in `orders` alone.
+    $masker = new ColumnMasker(
+        patterns: ['*address*'], allowlist: [], partial: [], placeholder: '[masked]',
+        scrubJson: false,
+        tableAllowlist: ['orders' => ['address_id']],
+    );
+
+    expect($masker->shouldMask('address_id', 'orders'))->toBeFalse();     // exposed here
+    expect($masker->shouldMask('address_id', 'customers'))->toBeTrue();   // still masked elsewhere
+    expect($masker->shouldMask('address_id'))->toBeTrue();                // and with no table context
+    expect($masker->shouldMask('billing_address', 'orders'))->toBeTrue(); // allowlist is column-specific
+});
+
+it('gives table_allowlist precedence over table_patterns', function () {
+    $masker = new ColumnMasker(
+        patterns: [], allowlist: [], partial: [], placeholder: '[masked]',
+        scrubJson: false,
+        tablePatterns: ['customers' => ['*']],
+        tableAllowlist: ['customers' => ['id']],
+    );
+
+    expect($masker->shouldMask('id', 'customers'))->toBeFalse();     // allowlist wins
+    expect($masker->shouldMask('name', 'customers'))->toBeTrue();    // pattern still applies
+});
+
+it('reads table-qualified maps from config', function () {
+    config()->set('mcp.masking', [
+        'patterns' => [],
+        'allowlist' => [],
+        'partial' => [],
+        'placeholder' => '[masked]',
+        'scrub_json' => false,
+        'table_patterns' => ['customers' => ['name']],
+        'table_allowlist' => ['orders' => ['address_id']],
+    ]);
+
+    $masker = ColumnMasker::fromConfig();
+
+    expect($masker->shouldMask('name', 'customers'))->toBeTrue();
+    expect($masker->shouldMask('name', 'tracks'))->toBeFalse();
+});

@@ -95,14 +95,16 @@ class SchemaDescribeTool extends AbstractDiagnosticTool
             ];
         }
 
-        $columns = array_map(function (array $column): array {
+        $columns = array_map(function (array $column) use ($table): array {
             $name = (string) $column['name'];
 
             return [
                 'name' => $name,
                 'type' => (string) ($column['type'] ?? $column['type_name'] ?? ''),
                 'nullable' => (bool) ($column['nullable'] ?? false),
-                'masked' => $this->masker->shouldMask($name),
+                // Table-qualified (0.3.0): the described table is known, so
+                // per-table rules are reflected in the reported mask flag.
+                'masked' => $this->masker->shouldMask($name, $table),
             ];
         }, Schema::connection($connection)->getColumns($table));
 

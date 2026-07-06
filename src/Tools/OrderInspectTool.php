@@ -111,7 +111,7 @@ class OrderInspectTool extends AbstractDiagnosticTool
                 ->where($foreignKey, $id)
                 ->limit($limit)
                 ->get()
-                ->map(fn ($row): array => $this->masker->maskRow((array) $row))
+                ->map(fn ($row): array => $this->masker->maskRow((array) $row, $relTable))
                 ->all();
 
             // A list (not keyed by table) so duplicate relations on the same
@@ -122,7 +122,7 @@ class OrderInspectTool extends AbstractDiagnosticTool
 
         return [
             'payload' => [
-                'order' => $this->masker->maskRow((array) $order),
+                'order' => $this->masker->maskRow((array) $order, $table),
                 'related' => $related,
             ],
             'row_count' => 1 + $relatedCount,

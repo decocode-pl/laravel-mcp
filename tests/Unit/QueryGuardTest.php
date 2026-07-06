@@ -128,3 +128,29 @@ it('guardProjection rejects aliasing and expressions that could evade masking', 
     'SELECT lower(email) FROM customers',                      // function wrapping evades exact-pattern masking
     "SELECT if(length('aaaaaaaa') > 0, password, null) FROM users", // padded auto-alias truncation rename
 ]);
+
+// ---- singleTableFrom: table context for masking (0.3.0) ------------------
+
+it('resolves the single source table of a plain SELECT', function (string $sql, ?string $expected) {
+    expect($this->guard->singleTableFrom($sql))->toBe($expected);
+})->with([
+    'bare table'          => ['SELECT * FROM customers', 'customers'],
+    'with WHERE'          => ['SELECT id, name FROM customers WHERE id = 1', 'customers'],
+    'back-ticked'         => ['SELECT * FROM `customers`', 'customers'],
+    'alias'               => ['SELECT * FROM customers c WHERE c.id = 1', 'customers'],
+    'alias with AS'       => ['SELECT * FROM customers AS c', 'customers'],
+    'db-qualified'        => ['SELECT * FROM shop.customers', 'customers'],
+    'trailing order/limit'=> ['SELECT * FROM customers ORDER BY id LIMIT 10', 'customers'],
+    'table named orders'  => ['SELECT * FROM orders WHERE status = 1', 'orders'],
+]);
+
+it('returns null when the source table is ambiguous or absent (deny-on-doubt)', function (string $sql) {
+    expect($this->guard->singleTableFrom($sql))->toBeNull();
+})->with([
+    'explicit JOIN'   => ['SELECT * FROM customers c JOIN tracks t ON t.id = c.track_id'],
+    'left join'       => ['SELECT * FROM customers LEFT JOIN orders ON orders.customer_id = customers.id'],
+    'comma join'      => ['SELECT * FROM customers, orders'],
+    'no from'         => ['SELECT 1'],
+    'show'            => ['SHOW TABLES'],
+    'explain'         => ['EXPLAIN SELECT * FROM customers'],
+]);

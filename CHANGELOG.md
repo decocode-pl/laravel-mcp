@@ -3,6 +3,32 @@
 All notable changes to `decocode/laravel-mcp` are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-07-06
+
+### Added — table-qualified masking
+- The same column name can be PII in one table and a harmless label in another (`customers.name` is a
+  person, `tracks.name` an entity; `revisions.old`/`new` hold audit values that elsewhere are not PII).
+  Name-based patterns cannot tell them apart, so two per-table maps now layer on top:
+  **`masking.table_patterns`** (`table.column` → mask) and **`masking.table_allowlist`**
+  (`table.column` → un-mask, so a globally-masked column such as a FK can be exposed in one table
+  only). Keys and column entries are glob patterns; a `'*'` table key applies to every table.
+- Applied wherever the tool knows the source table: `schema_describe`, `count_rows` (oracle guard),
+  `order_inspect`, and **single-table `read_query` SELECTs** (`QueryGuard::singleTableFrom` resolves
+  the table; a JOIN / comma-join / non-SELECT yields no table and masking falls back to name-based —
+  never weaker than before). Nested JSON keys have no table context and stay name-based.
+- **Backwards compatible:** `ColumnMasker::shouldMask/maskValue/maskRow` take an optional `?string
+  $table` (default `null` → exactly the pre-0.3.0 name-based behaviour). No config change required.
+
+### Added — `mcp:masking:audit`
+- Full-schema masking audit: scans every readable table and flags columns that **look** like PII
+  (`PiiHeuristic`, deliberately broader than the masking patterns, incl. Polish/legacy spellings)
+  but are **not** masked (table-aware). This is the answer to a hard lesson — reviewing masking
+  against a diff or a hand-built list passes gaps a full scan catches (a legacy mail/phone column
+  under a non-obvious name, `revisions.old/new`, a bare `ip`). Meant to be part of a deployment's
+  Definition of Done.
+- `--json` for machine-readable output; `--strict` exits non-zero on any gap (CI / DoD gate). Read-only
+  (introspects `information_schema` — MySQL-only — never any data).
+
 ## [0.2.0] - 2026-07-05
 
 ### Added — channel B (claude.ai OAuth) scaffolding

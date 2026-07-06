@@ -87,6 +87,17 @@ it('read_query masks sensitive columns and scrubs nested JSON PII', function () 
     expect($meta['buyer']['city'])->toBe('Kraków');
 });
 
+it('read_query applies a table_pattern to a single-table SELECT (0.3.0)', function () {
+    // The bare `name` is PII in customers → mask it there via a table pattern.
+    config()->set('mcp.masking.table_patterns', ['customers' => ['name']]);
+    test()->actingAs(readAccount(), 'mcp');
+
+    $response = callTool(app(ReadQueryTool::class), ['sql' => 'SELECT id, name FROM customers']);
+
+    $row = json_decode((string) $response->content(), true)['rows'][0];
+    expect($row['name'])->toBe('[masked]');   // resolved to `customers` → table pattern hits
+});
+
 it('read_query rejects column aliasing (masking evasion)', function () {
     test()->actingAs(readAccount(), 'mcp');
 

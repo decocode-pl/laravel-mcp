@@ -83,8 +83,13 @@ class ReadQueryTool extends AbstractDiagnosticTool
 
         $rows = DB::connection($connection)->select($safeSql);
 
+        // Table-qualified masking (0.3.0): a single-table SELECT gives maskRow the
+        // source table, so per-table rules (e.g. customers.name) apply. A JOIN /
+        // non-SELECT yields null and masking falls back to name-based only.
+        $table = $this->guard->singleTableFrom($safeSql);
+
         $masked = array_map(
-            fn ($row): array => $this->masker->maskRow((array) $row),
+            fn ($row): array => $this->masker->maskRow((array) $row, $table),
             $rows
         );
 

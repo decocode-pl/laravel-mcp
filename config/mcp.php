@@ -119,8 +119,37 @@ return [
         'partial' => [],     // e.g. 'email' => 'email', 'card_number' => 'last4'
         'placeholder' => '[masked]',
 
+        // Table-qualified masking (0.3.0): the same column name can be PII in one
+        // table and a harmless label in another — `customers.name` is a person,
+        // `tracks.name` an entity; `revisions.old`/`new` hold values that in other
+        // tables are not PII. Name-based patterns above cannot tell them apart
+        // (they see only the column name), so these two maps add per-table
+        // precision on top. Applied ONLY when the tool knows the source table
+        // (schema_describe, count_rows, order_inspect, and single-table SELECTs in
+        // read_query — a JOIN result has no single source table and stays
+        // name-based). Keys AND column entries are glob patterns (`*` wildcard);
+        // a `'*'` table key applies to every table.
+        //
+        // table_patterns — mask these columns within matching tables:
+        'table_patterns' => [
+            // 'customers' => ['name'],            // person name in this table only
+            // 'revisions' => ['old', 'new'],      // audit before/after values
+            // '*'         => ['ip', 'ip_forwarded'],  // any table with a raw IP
+        ],
+        // table_allowlist — un-mask these columns within matching tables. This is
+        // the most specific rule and wins over everything, so it can expose a
+        // globally-masked column in ONE table without exposing it everywhere — e.g.
+        // a FK the broad `*address*` pattern masks, needed for joins in one table.
+        // CAUTION: a glob table key (`'*'`, `orders*`) lifts the mask across EVERY
+        // matching table (and view) — keep keys specific. `mcp:masking:audit` will
+        // flag anything you accidentally leave un-masked.
+        'table_allowlist' => [
+            // 'orders' => ['address_id'],
+        ],
+
         // PR-001: recursively mask PII nested inside JSON/serialized columns
         // (e.g. print_job_payloads) by key name, not just top-level columns.
+        // (Nested keys carry no table context — they use the name-based rules.)
         'scrub_json' => (bool) env('MCP_MASK_SCRUB_JSON', true),
     ],
 

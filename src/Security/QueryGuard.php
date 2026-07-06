@@ -232,6 +232,63 @@ class QueryGuard
         return preg_match('/^(\*|'.$ident.'(\.(\*|'.$ident.'))?|\d+(\.\d+)?)$/', $item) === 1;
     }
 
+    /**
+     * The single source table of a plain SELECT, for table-qualified masking
+     * (0.3.0). Returns null — deny-on-doubt — for anything that is not
+     * unambiguously one table: non-SELECT, a JOIN or comma-join (the flat result
+     * mixes columns whose origin table we cannot tell apart), or an unparseable
+     * FROM. A null result means masking falls back to the name-based layers,
+     * i.e. exactly the pre-0.3.0 behaviour — never worse.
+     *
+     * Assumes guardProjection() has already run (read_query does), which rejects
+     * CTEs, set operations and subqueries in FROM and restricts the projection to
+     * bare identifiers / `*`, so the first top-level `from` is the real one and
+     * no function like `substring(x FROM y)` can appear in the projection.
+     *
+     * A table literally named after a clause keyword (`order`, `group`) splits the
+     * clause early and yields null → name-based fallback. That is the safe
+     * deny-on-doubt outcome, not a correctness bug.
+     */
+    public function singleTableFrom(string $sql): ?string
+    {
+        $lower = strtolower((string) preg_replace(
+            '/\s+/', ' ',
+            $this->stripStringLiterals(trim($this->stripComments($sql)))
+        ));
+
+        // Only a plain SELECT surfaces row data that maskRow() will process.
+        if (! str_starts_with($lower, 'select ')) {
+            return null;
+        }
+
+        if (preg_match('/\bfrom\s+(.+)$/s', $lower, $m) !== 1) {
+            return null;
+        }
+
+        // Isolate the FROM clause: stop at the first following clause keyword.
+        $clause = (string) preg_split(
+            '/\b(where|group|having|order|limit|union|for|into|window)\b/',
+            $m[1],
+            2
+        )[0];
+
+        // A JOIN (any flavour) or a comma-join means more than one table — the
+        // flat result mixes columns we cannot attribute to one table → null.
+        if (preg_match('/\b(join|inner|left|right|cross|natural|straight_join)\b/', $clause) === 1
+            || str_contains($clause, ',')) {
+            return null;
+        }
+
+        // First identifier = the table (optionally `db.table`, optionally
+        // back-ticked); a trailing token is an alias we ignore.
+        if (preg_match('/^\s*`?([a-z_][a-z0-9_$]*)`?(?:\.`?([a-z_][a-z0-9_$]*)`?)?/', $clause, $t) !== 1) {
+            return null;
+        }
+
+        // `db.table` → the table part; otherwise the sole identifier.
+        return ($t[2] ?? '') !== '' ? $t[2] : $t[1];
+    }
+
     public function enforceLimit(string $sql, int $max): string
     {
         $sql = rtrim(trim($sql), ';');

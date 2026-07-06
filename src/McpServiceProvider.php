@@ -13,6 +13,7 @@ use Decocode\LaravelMcp\Console\AccountRevokeCommand;
 use Decocode\LaravelMcp\Console\GrantsDiffCommand;
 use Decocode\LaravelMcp\Console\GrantsPrintCommand;
 use Decocode\LaravelMcp\Console\InstallCommand;
+use Decocode\LaravelMcp\Console\MaskingAuditCommand;
 use Decocode\LaravelMcp\Console\TokenIssueCommand;
 use Decocode\LaravelMcp\Console\TokenRevokeCommand;
 use Decocode\LaravelMcp\Http\Middleware\EnsureIpAllowed;
@@ -69,6 +70,7 @@ class McpServiceProvider extends ServiceProvider
                 InstallCommand::class,
                 GrantsPrintCommand::class,
                 GrantsDiffCommand::class,
+                MaskingAuditCommand::class,
                 AccountCreateCommand::class,
                 AccountListCommand::class,
                 AccountGrantCommand::class,
