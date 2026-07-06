@@ -3,6 +3,25 @@
 All notable changes to `decocode/laravel-mcp` are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.1] - 2026-07-06
+
+### Fixed — `read_query` now rejects JOINs (PII leak)
+- A JOIN (or comma-join) in `read_query` produced a flat result whose columns come from more than one
+  table. Table-qualified masking (`table_patterns` / `table_allowlist`) keys on a **single** source
+  table, so it could not attribute a JOINed column and silently fell back to name-based masking —
+  letting a column masked **only** per-table (e.g. `customers.name`) surface raw through a trivial
+  `SELECT c.name FROM customers c JOIN orders o …`. `QueryGuard::guardProjection` now **rejects JOINs
+  and comma-joins** outright, the same way it already rejects UNION / CTEs / `FROM`-subqueries /
+  aliasing (all evade name-based masking). `read_query` is single-table by design; `count_rows` and
+  `order_inspect` own their SQL and are unaffected. **Any deployment using `table_patterns` should
+  upgrade.**
+
+### Improved — `PiiHeuristic` now flags secrets & crypto material
+- `mcp:masking:audit` missed key/secret columns a name-based review also misses (`hmac_key`,
+  Web-Push `p256dh_key`/`auth_key`, `laravel_session_id`). Added: `hmac`, `session`, `hash`, `cipher`,
+  `nonce`, `credential` (substring) and whole-token `key`, `salt`, `jwt`, `otp` (so `*_key` is flagged
+  without swallowing `monkey`/`turkey`). Heuristic only — a hit is an audit suggestion to confirm.
+
 ## [0.3.0] - 2026-07-06
 
 ### Added — table-qualified masking

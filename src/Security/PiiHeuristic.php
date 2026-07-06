@@ -36,9 +36,13 @@ final class PiiHeuristic
         // National / financial identifiers
         'pesel', 'passport', 'paszport', 'dowod', 'id_card', 'tax_id', 'iban',
         'bank', 'account', 'konto', 'card', 'swift', 'blik',
-        // Secrets
+        // Secrets & crypto material (a full-schema secret sweep found columns a
+        // name-based review misses: `hmac_key`, `p256dh_key`/`auth_key` Web-Push
+        // keys, `laravel_session_id`). `key` / `salt` live in SHORT (whole-token)
+        // so they flag `*_key` without swallowing `monkey`/`turkey`.
         'password', 'passwd', 'haslo', 'secret', 'token', 'api_key', 'apikey',
-        'private_key', 'signature', 'user_agent',
+        'private_key', 'signature', 'user_agent', 'hmac', 'cipher', 'nonce',
+        'credential',
         // Demographic
         'birth', 'urodzen', 'gender', 'nationality', 'obywatelstwo',
         // Free-form fields that routinely carry PII in practice
@@ -52,6 +56,7 @@ final class PiiHeuristic
     private const SHORT = [
         'ip', 'old', 'new', 'age', 'dob', 'geo', 'lat', 'lng', 'lon',
         'nip', 'ssn', 'vat', 'regon', 'cvv', 'cvc', 'pin', 'plec', 'tel', 'fax', 'gsm',
+        'key', 'salt', 'jwt', 'otp', 'session', 'hash',
     ];
 
     public static function looksLikePii(string $column): bool

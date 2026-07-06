@@ -163,8 +163,10 @@ applies this Passport bootstrap automatically when channel B is on (opt out with
   named `email` → domain). **Table-qualified** rules (`masking.table_patterns` /
   `masking.table_allowlist`) close the bare-`name` gap at the source — mask a column only in the
   table(s) where it is PII — and apply wherever the tool knows the source table (`schema_describe`,
-  `count_rows`, `order_inspect`, and single-table `read_query` SELECTs; a JOIN result stays
-  name-based). Audit coverage with `php artisan mcp:masking:audit`.
+  `count_rows`, `order_inspect`, and `read_query` SELECTs — which are single-table by design, since
+  `read_query` **rejects JOINs and comma-joins** (a multi-table result has no single source table and
+  would fall back to name-based masking, letting a per-table-masked column leak). Audit coverage with
+  `php artisan mcp:masking:audit`.
 - **Capabilities** (`read` / `write` / `command:run`) are stored in `mcp_*` tables and managed via
   artisan commands — never in the repo.
 
@@ -176,7 +178,7 @@ trail (if the call cannot be logged, no data is returned).
 
 | Tool | Capability | What it does |
 |---|---|---|
-| `read_query` | `read` | Ad-hoc `SELECT` against `mcp_ro`. SELECT-only, single statement, forced LIMIT, blocked tables refused, sensitive columns + nested JSON masked. To keep masking from being evaded, the projection allows only `*` / `t.*` / bare columns / numeric literals — **function calls, expressions, aliasing, `UNION`/`INTERSECT`/`EXCEPT`, CTEs, `FROM`-subqueries and JSON extraction are rejected** (any of them can rename a column past name-based masking). Aggregates live in `count_rows`. |
+| `read_query` | `read` | Ad-hoc `SELECT` against `mcp_ro`. SELECT-only, single statement, forced LIMIT, blocked tables refused, sensitive columns + nested JSON masked. To keep masking from being evaded, the projection allows only `*` / `t.*` / bare columns / numeric literals — **function calls, expressions, aliasing, `UNION`/`INTERSECT`/`EXCEPT`, CTEs, `FROM`-subqueries, JOINs/comma-joins and JSON extraction are rejected** (each can surface a column past name-based or table-qualified masking). Single-table only — aggregates live in `count_rows`. |
 | `count_rows` | `read` | Row count for a table, optional `WHERE`. The projection is fixed to `COUNT(*)` (never a column value), the table must be a plain non-blocked identifier, and the assembled query is guarded. Fills the aggregation gap `read_query` leaves. |
 | `schema_describe` | `read` | Lists readable tables, or a table's columns. Blocked tables are hidden; each column notes whether its values are masked. Returns **no row data**. |
 | `order_inspect` | `read` | Example domain tool — fetches one record + related rows by id. **Config-driven**; only registers once `mcp.tools.order_inspect` is set, so the package ships no project-specific schema. |

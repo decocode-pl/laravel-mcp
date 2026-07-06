@@ -36,6 +36,8 @@ class QueryGuard
 
     public function validate(string $sql): void
     {
+        $this->assertNoExecutableComments($sql);
+
         $sql = trim($this->stripComments($sql));
 
         if ($sql === '') {
@@ -73,6 +75,8 @@ class QueryGuard
      */
     public function sanitize(string $sql, int $max): string
     {
+        $this->assertNoExecutableComments($sql);
+
         $normalized = trim($this->stripComments($sql));
 
         $this->validate($normalized);
@@ -95,6 +99,8 @@ class QueryGuard
      */
     public function guardProjection(string $sql): void
     {
+        $this->assertNoExecutableComments($sql);
+
         $lower = strtolower((string) preg_replace(
             '/\s+/', ' ',
             $this->stripStringLiterals(trim($this->stripComments($sql)))
@@ -149,6 +155,52 @@ class QueryGuard
                 );
             }
         }
+
+        // read_query must resolve to EXACTLY ONE source table. A JOIN, a comma-join,
+        // or an unparseable/ambiguous FROM (e.g. a first table named after a clause
+        // keyword — `FROM `order` JOIN …`) leaves table-qualified masking
+        // (table_patterns / table_allowlist) unable to attribute columns to a table,
+        // so it silently falls back to name-based masking and a column masked only
+        // per-table (e.g. customers.name) leaks. Deny on doubt: if there is a FROM
+        // but singleTableFrom() cannot pin it to one table, refuse — do not guess.
+        // This closes the whole class (JOIN/comma/reserved-word/unparseable) with a
+        // single check instead of pattern-matching each shape. count_rows and
+        // order_inspect own their SQL and never reach here. Checked AFTER the
+        // projection loop, which has already rejected functions/aliasing.
+        if (preg_match('/\bfrom\b/', $lower) === 1 && $this->singleTableFrom($sql) === null) {
+            throw new QueryGuardException(
+                'read_query requires a single, unambiguous source table — JOINs, '
+                .'comma-joins and multi-table FROM are not allowed (they evade '
+                .'table-qualified masking). Query one table at a time, or use '
+                .'count_rows / order_inspect.'
+            );
+        }
+    }
+
+    /**
+     * Isolate the FROM clause of a normalized (comment/string-stripped, whitespace-
+     * collapsed) lower-case SQL: the text after the first top-level FROM up to the
+     * next clause keyword. Null when there is no FROM. Shared by guardProjection()'s
+     * single-table check and singleTableFrom() so both read the same clause boundary.
+     *
+     * The clause-keyword split requires WHITESPACE before the keyword (`\s+`, not a
+     * bare `\b`): otherwise a table named after a reserved word and back-ticked
+     * (`FROM `order` JOIN …`) would split on the `order` INSIDE the back-ticks,
+     * truncating the clause before the JOIN and hiding a multi-table FROM. With
+     * `\s+`, a real clause keyword (always preceded by space) still ends the clause,
+     * but a back-ticked table name does not.
+     */
+    private function fromClause(string $lower): ?string
+    {
+        if (preg_match('/\bfrom\s+(.+)$/s', $lower, $m) !== 1) {
+            return null;
+        }
+
+        return (string) preg_split(
+            '/\s+(where|group|having|order|limit|union|for|into|window)\b/',
+            $m[1],
+            2
+        )[0];
     }
 
     /**
@@ -245,9 +297,12 @@ class QueryGuard
      * bare identifiers / `*`, so the first top-level `from` is the real one and
      * no function like `substring(x FROM y)` can appear in the projection.
      *
-     * A table literally named after a clause keyword (`order`, `group`) splits the
-     * clause early and yields null → name-based fallback. That is the safe
-     * deny-on-doubt outcome, not a correctness bug.
+     * A back-ticked table named after a clause keyword (`` `order` ``, `` `group` ``)
+     * resolves correctly: fromClause() splits on a clause keyword only when it is
+     * preceded by whitespace, so a back-ticked table name is not mistaken for the
+     * clause it shares a name with (this closed PR-001, where such a name let a
+     * JOIN slip past the single-table check). read_query's guardProjection() treats
+     * a null here as deny-on-doubt and refuses the query rather than falling back.
      */
     public function singleTableFrom(string $sql): ?string
     {
@@ -261,21 +316,18 @@ class QueryGuard
             return null;
         }
 
-        if (preg_match('/\bfrom\s+(.+)$/s', $lower, $m) !== 1) {
+        $clause = $this->fromClause($lower);
+
+        if ($clause === null) {
             return null;
         }
 
-        // Isolate the FROM clause: stop at the first following clause keyword.
-        $clause = (string) preg_split(
-            '/\b(where|group|having|order|limit|union|for|into|window)\b/',
-            $m[1],
-            2
-        )[0];
-
-        // A JOIN (any flavour) or a comma-join means more than one table — the
-        // flat result mixes columns we cannot attribute to one table → null.
-        if (preg_match('/\b(join|inner|left|right|cross|natural|straight_join)\b/', $clause) === 1
-            || str_contains($clause, ',')) {
+        // A JOIN (every flavour spells `join`; `straight_join` hides it after an
+        // underscore, so match it explicitly) or a comma-join means more than one
+        // table — the flat result mixes columns we cannot attribute to one table →
+        // null. read_query already rejects these in guardProjection(); this stays
+        // as defence-in-depth for any other caller.
+        if (preg_match('/\bjoin\b|\bstraight_join\b/', $clause) === 1 || str_contains($clause, ',')) {
             return null;
         }
 
@@ -345,6 +397,30 @@ class QueryGuard
         $withoutTrailing = rtrim($withoutStrings, "; \t\n\r");
 
         return str_contains($withoutTrailing, ';');
+    }
+
+    /**
+     * MySQL "executable comments" — opened with the bang marker (slash-star-bang,
+     * optionally version-gated like `50000`) — are EXECUTED by the server but
+     * silently removed by stripComments(), so a JOIN, a forbidden keyword or a set
+     * operation hidden inside one would run while every downstream check sees clean,
+     * single-table SQL. Example: `SELECT * FROM orders o` then a bang-comment holding
+     * `JOIN customers c ON ...` reads as one table here, but MySQL joins customers and
+     * leaks its PII past table-qualified masking. Reject the marker outright —
+     * read_query never needs version-gated SQL. Scans the RAW bytes, before any
+     * stripComments() — and WITHOUT stripping string literals first: literal
+     * stripping assumes backslash escaping, but under sql_mode=NO_BACKSLASH_ESCAPES
+     * MySQL pairs quotes differently, so a crafted literal could hide the marker
+     * from the stripper yet have MySQL execute it (SECURITY-002). A raw byte scan
+     * closes that regardless of quote pairing; a legitimate value literally
+     * containing the marker is vanishingly rare in diagnostic SELECTs, so
+     * deny-on-doubt is the safe trade.
+     */
+    private function assertNoExecutableComments(string $rawSql): void
+    {
+        if (str_contains($rawSql, '/*!')) {
+            throw new QueryGuardException('MySQL executable comments are not allowed in read_query.');
+        }
     }
 
     private function stripComments(string $sql): string

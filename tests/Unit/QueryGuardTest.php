@@ -103,10 +103,12 @@ it('guardProjection allows plain columns, wildcards and bare function calls', fu
 })->with([
     'SELECT * FROM customers WHERE id = 1',
     'SELECT id, name, created_at FROM customers',
-    'SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id',
+    'SELECT c.name FROM customers c WHERE c.id = 1',   // single-table alias: still fine
     'SELECT DISTINCT status FROM orders',
     'SELECT 1',
     'SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers)', // subquery in WHERE is fine
+    'SELECT id, join_date FROM members WHERE join_date > 1', // `join_date` column is not a JOIN
+    'SELECT * FROM `order` WHERE id = 1', // single table named after a reserved word: still one table
 ])->throwsNoExceptions();
 
 it('guardProjection rejects aliasing and expressions that could evade masking', function (string $sql) {
@@ -129,6 +131,50 @@ it('guardProjection rejects aliasing and expressions that could evade masking', 
     "SELECT if(length('aaaaaaaa') > 0, password, null) FROM users", // padded auto-alias truncation rename
 ]);
 
+it('guardProjection rejects JOINs and comma-joins (evade table-qualified masking)', function (string $sql) {
+    expect(fn () => $this->guard->guardProjection($sql))->toThrow(QueryGuardException::class);
+})->with([
+    'SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id', // was previously allowed
+    'SELECT c.name FROM customers c JOIN orders o ON o.customer_id = c.id',       // explicit JOIN
+    'SELECT * FROM customers c LEFT JOIN orders o ON o.customer_id = c.id',       // LEFT JOIN
+    'SELECT * FROM customers c INNER JOIN orders o ON o.id = c.id',               // INNER JOIN
+    'SELECT * FROM customers CROSS JOIN orders',                                  // CROSS JOIN
+    'SELECT a.id FROM a STRAIGHT_JOIN b ON a.id = b.id',                          // STRAIGHT_JOIN
+    'SELECT * FROM customers, orders',                                            // comma-join
+    'SELECT c.name, o.id FROM customers c, orders o WHERE c.id = o.customer_id',  // comma-join with WHERE
+    // PR-001: first table named after a clause keyword (back-ticked reserved word)
+    // must not let the JOIN slip past the clause-boundary split.
+    'SELECT c.name FROM `order` JOIN customers c ON c.id = `order`.customer_id',
+    'SELECT c.name FROM `group` STRAIGHT_JOIN customers c ON 1 = 1',
+    'SELECT * FROM `limit`, customers',
+]);
+
+it('rejects MySQL executable comments that hide SQL from the guard (SECURITY-001)', function (string $sql) {
+    // Executed by MySQL, stripped by stripComments() — must be rejected at BOTH gates.
+    expect(fn () => $this->guard->guardProjection($sql))->toThrow(QueryGuardException::class);
+    expect(fn () => $this->guard->validate($sql))->toThrow(QueryGuardException::class);
+    expect(fn () => $this->guard->sanitize($sql, 100))->toThrow(QueryGuardException::class);
+})->with([
+    'SELECT * FROM orders o /*!JOIN*/ customers c ON o.customer_id = c.id', // hidden JOIN → PII leak
+    'SELECT * FROM orders o /*!50000 JOIN*/ customers c ON o.id = c.id',    // versioned executable comment
+    'SELECT id FROM t /*!UNION SELECT password FROM users*/',               // hidden set operation
+    'SELECT /*!12345 password */ FROM users',                              // hidden projection column
+]);
+
+it('still allows ordinary (non-executable) block comments', function () {
+    $this->guard->validate('SELECT id /* just a note */ FROM customers');
+    $this->guard->guardProjection('SELECT id /* just a note */ FROM customers');
+})->throwsNoExceptions();
+
+it('rejects an executable comment hidden by crafted quotes regardless of sql_mode (SECURITY-002)', function () {
+    // `\'` reads as an escaped quote to backslash-based literal stripping (which would
+    // swallow the whole span incl. the marker), but under NO_BACKSLASH_ESCAPES MySQL
+    // closes the first literal and executes the comment. A raw byte scan rejects it.
+    $sql = "SELECT id FROM orders WHERE note = 'x\\' /*!JOIN*/ customers c ON 1=1";
+    expect(fn () => $this->guard->sanitize($sql, 100))->toThrow(QueryGuardException::class);
+    expect(fn () => $this->guard->guardProjection($sql))->toThrow(QueryGuardException::class);
+});
+
 // ---- singleTableFrom: table context for masking (0.3.0) ------------------
 
 it('resolves the single source table of a plain SELECT', function (string $sql, ?string $expected) {
@@ -142,6 +188,8 @@ it('resolves the single source table of a plain SELECT', function (string $sql, 
     'db-qualified'        => ['SELECT * FROM shop.customers', 'customers'],
     'trailing order/limit'=> ['SELECT * FROM customers ORDER BY id LIMIT 10', 'customers'],
     'table named orders'  => ['SELECT * FROM orders WHERE status = 1', 'orders'],
+    'reserved-word table' => ['SELECT * FROM `order`', 'order'],
+    'reserved-word + where' => ['SELECT * FROM `order` WHERE id = 1', 'order'],
 ]);
 
 it('returns null when the source table is ambiguous or absent (deny-on-doubt)', function (string $sql) {
