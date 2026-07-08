@@ -7,13 +7,17 @@ namespace Decocode\LaravelMcp\Tools;
 use Decocode\LaravelMcp\Audit\AuditException;
 use Decocode\LaravelMcp\Audit\AuditLogger;
 use Decocode\LaravelMcp\Capabilities\CapabilityResolver;
+use Decocode\LaravelMcp\Security\DatabaseErrorReason;
 use Decocode\LaravelMcp\Security\QueryGuardException;
 use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 use Laravel\Mcp\Request;
 use Laravel\Mcp\Response;
 use Laravel\Mcp\Server\Tool;
+use Laravel\Mcp\Support\ValidationMessages;
 use Throwable;
 
 /**
@@ -72,6 +76,19 @@ abstract class AbstractDiagnosticTool extends Tool
             $outcome = $this->run($request);
         } catch (QueryGuardException $e) {
             return Response::error('Query rejected: '.$e->getMessage());
+        } catch (ValidationException $e) {
+            // A missing or ill-typed argument (e.g. calling read_query without
+            // `sql`): surface the framework's field-level message so the operator
+            // fixes the call, instead of the generic "failed to run".
+            return Response::error(ValidationMessages::from($e));
+        } catch (QueryException $e) {
+            // SQL that parsed but the database rejected (unknown column, syntax
+            // error). This is a *diagnostic* tool: the operator who wrote the
+            // statement should see the real reason to correct it. DatabaseErrorReason
+            // surfaces only structural (SQLSTATE class 42) errors verbatim and
+            // collapses data-dependent ones, so no row value can leak through the
+            // error path past the masker.
+            return Response::error('Query failed: '.DatabaseErrorReason::from($e));
         } catch (Throwable $e) {
             report($e);
 

@@ -165,6 +165,52 @@ it('read_query records a fail-closed audit row', function () {
     expect($audit->channel)->toBe('query');
 });
 
+it('read_query reports a DB error without leaking a WHERE literal (0.3.2 DX)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // A query that parses and passes the guard but the database rejects, with a
+    // would-be-PII literal in the WHERE. On SQLite an unknown column is HY000, so
+    // the reason collapses to the generic message (the verbatim structural error is
+    // MySQL-only — see DatabaseErrorReasonTest). Either way, nothing may leak.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => "SELECT payer FROM customers WHERE email = 'leaked-pii@example.com'",
+    ]);
+
+    expect($response->isError())->toBeTrue();
+
+    $message = (string) $response->content();
+    expect($message)->toContain('Query failed:');
+    expect($message)->not->toContain('The diagnostic tool');  // not the generic catch-all
+    expect($message)->not->toContain('leaked-pii@example.com'); // bound WHERE literal never surfaces
+    expect($message)->not->toContain(', SQL:');
+    expect($message)->not->toContain('(Connection:');
+});
+
+it('count_rows also routes DB errors through the shared handler (0.3.2 DX)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // Same change lives in the shared handle(); prove it for a second tool.
+    $response = callTool(app(CountRowsTool::class), ['table' => 'no_such_table_xyz']);
+
+    expect($response->isError())->toBeTrue();
+
+    $message = (string) $response->content();
+    expect($message)->toContain('Query failed:');
+    expect($message)->not->toContain('The diagnostic tool');  // not the generic catch-all
+});
+
+it('read_query returns a clear message when the required sql argument is missing (0.3.2 DX)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    $response = callTool(app(ReadQueryTool::class), []);
+
+    expect($response->isError())->toBeTrue();
+
+    $message = (string) $response->content();
+    expect($message)->toContain('sql');                       // names the offending field
+    expect($message)->not->toContain('The diagnostic tool');  // not the generic catch-all
+});
+
 it('hides tools from an identity without the read capability', function () {
     $account = McpServiceAccount::create(['name' => 'noperm']);
     test()->actingAs($account, 'mcp');

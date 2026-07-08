@@ -3,6 +3,28 @@
 All notable changes to `decocode/laravel-mcp` are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.2] - 2026-07-08
+
+### Improved — diagnostic tools now surface the real reason a query failed
+- The shared `handle()` catch-all turned **every** execution error into a generic
+  `The diagnostic tool failed to run.`, sending the real cause only to `laravel.log`. For a
+  *diagnostic* tool that is poor DX — an operator writing SELECTs must see why a query was rejected.
+  Two error classes are now returned to the caller; everything else is unchanged:
+  - **Missing/ill-typed argument** (e.g. `read_query` called without `sql`) → the framework's
+    field-level validation message (`The sql field is required.`) instead of the generic failure.
+  - **Database errors** → `Query failed: {reason}`, gated by SQLSTATE (`DatabaseErrorReason`). Only
+    **structural** errors (SQLSTATE class 42 — unknown column/table, syntax) are surfaced verbatim:
+    their text is statement/schema-derived and never a row value. Every other class collapses to a
+    generic `The database rejected the statement.` — notably data exceptions (class 22) and runtime
+    errors (HY000) where a driver can embed a **column value** in the message (e.g. MySQL's `Truncated
+    incorrect value: '<row value>'`). This closes the gap the masker cannot: masking only runs on the
+    success path over result rows, so a value it would hide must not leak through the error path. The
+    reason is read from the driver (PDO) message, which never carries the bound SQL, and the class-42
+    discriminator is MySQL behaviour (SQLite reports these as HY000 → generic; verified against
+    synthetic SQLSTATE codes in `DatabaseErrorReasonTest`, to be confirmed on the pilot DB at deploy).
+- `QueryGuard` rejections (`Query rejected: …`) and all other throwables (generic message + `report()`)
+  are unchanged. Centralised in `AbstractDiagnosticTool::handle()`, so all four tools benefit.
+
 ## [0.3.1] - 2026-07-06
 
 ### Fixed — `read_query` now rejects JOINs (PII leak)
