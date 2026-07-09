@@ -194,3 +194,40 @@ it('reads table-qualified maps from config', function () {
     expect($masker->shouldMask('name', 'customers'))->toBeTrue();
     expect($masker->shouldMask('name', 'tracks'))->toBeFalse();
 });
+
+it('finds the first masked identifier in a SQL fragment (oracle guard helper)', function () {
+    $masker = new ColumnMasker(['*email*', 'password'], [], [], '[masked]');
+
+    // A masked column referenced anywhere in the fragment is reported.
+    expect($masker->firstMaskedIdentifier("email like 'a%'"))->toBe('email');
+    expect($masker->firstMaskedIdentifier('status = 1 and password is not null'))->toBe('password');
+
+    // Nothing masked → null; empty fragment → null.
+    expect($masker->firstMaskedIdentifier('id = 1 and status = 2'))->toBeNull();
+    expect($masker->firstMaskedIdentifier(''))->toBeNull();
+});
+
+it('scans identifiers with a leading digit (back-ticked column names)', function () {
+    // A back-ticked column may start with a digit; dropping it would miss an
+    // exact-match pattern. Bare numbers are scanned but never match a column.
+    $masker = new ColumnMasker(['2fa_secret'], [], [], '[masked]');
+
+    expect($masker->firstMaskedIdentifier("where  2fa_secret = ''"))->toBe('2fa_secret');
+    expect($masker->firstMaskedIdentifier('where id > 500'))->toBeNull();
+});
+
+it('honours per-table masking when scanning a fragment', function () {
+    // `name` is PII only in customers (a table pattern), plain elsewhere.
+    $masker = new ColumnMasker(
+        patterns: [],
+        allowlist: [],
+        partial: [],
+        placeholder: '[masked]',
+        scrubJson: false,
+        tablePatterns: ['customers' => ['name']],
+    );
+
+    expect($masker->firstMaskedIdentifier('name = 1', 'customers'))->toBe('name');
+    expect($masker->firstMaskedIdentifier('name = 1', 'tracks'))->toBeNull();
+    expect($masker->firstMaskedIdentifier('name = 1'))->toBeNull();   // no table context
+});

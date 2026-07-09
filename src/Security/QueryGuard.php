@@ -101,10 +101,7 @@ class QueryGuard
     {
         $this->assertNoExecutableComments($sql);
 
-        $lower = strtolower((string) preg_replace(
-            '/\s+/', ' ',
-            $this->stripStringLiterals(trim($this->stripComments($sql)))
-        ));
+        $lower = $this->normalize($sql);
 
         if (str_starts_with($lower, 'with ') || $lower === 'with') {
             throw new QueryGuardException('CTEs (WITH) are not supported by read_query; inline them as subqueries.');
@@ -122,14 +119,22 @@ class QueryGuard
             throw new QueryGuardException('JSON extraction (json_extract / json_table / -> / ->>) is not allowed in read_query.');
         }
 
-        // Derived tables / subqueries in FROM|JOIN carry their OWN projection,
-        // which this guard does not inspect — an alias there (`FROM (SELECT
-        // password AS x ...) t`) would rename PII past the masker. Reject them
-        // (deny-on-doubt, like CTEs and set operations). Subqueries in WHERE are
-        // unaffected: they don't surface columns into the result.
-        if (preg_match('/\b(?:from|join)\s*\(/', $lower) === 1) {
-            throw new QueryGuardException('Subqueries / derived tables in FROM are not allowed in read_query.');
+        // Window functions (`… OVER (…)` / `OVER w`) and the named WINDOW clause let a
+        // masked column drive row ordering/partitioning from a region the oracle guard
+        // does NOT scan — it only reads the WHERE/ORDER-BY tail, but
+        // `WINDOW w AS (PARTITION BY password) ORDER BY SUM(id) OVER w` orders the rows
+        // by the masked value from inside the WINDOW clause. A window function can also
+        // live in ORDER BY, which guardProjection does not inspect for functions.
+        // read_query needs no window analytics: reject the whole family (deny-on-doubt).
+        // `\b` on both sides so a column like `handover`/`window_start` is not tripped.
+        if (preg_match('/\bover\b|\bwindow\b/', $lower) === 1) {
+            throw new QueryGuardException('Window functions (OVER / WINDOW) are not allowed in read_query.');
         }
+
+        // Any subquery is rejected — not just in FROM (see assertNoSubquery). count_rows
+        // shares this guard: it accepts a user WHERE fragment that can carry the same
+        // cross-table subquery oracle.
+        $this->assertNoSubquery($sql);
 
         // Only SELECT has a user-controlled projection to worry about.
         if (! str_starts_with($lower, 'select')) {
@@ -201,6 +206,129 @@ class QueryGuard
             $m[1],
             2
         )[0];
+    }
+
+    /**
+     * The filter/sort tail of a SELECT: everything from the first WHERE / GROUP /
+     * HAVING / ORDER keyword to the end. This is the region where referencing a
+     * masked column turns the result into an existence/order oracle
+     * (`WHERE api_token LIKE 'ab%'`, `ORDER BY pesel`), so read_query scans it the
+     * way count_rows scans its WHERE fragment. Returns '' when there is no such
+     * clause (`SELECT * FROM t`).
+     *
+     * MySQL requires no whitespace to delimit a clause keyword — it is a token on its
+     * own however it abuts its neighbours. A naive `\s`-anchored match leaks whenever
+     * the keyword touches a non-space separator:
+     *   - after the keyword: `WHERE(email LIKE 'a%')` (paren, no space)
+     *   - before it: `` `users`WHERE `` (closing back-tick), `USE INDEX(x)WHERE`,
+     *     `PARTITION(p)WHERE` (closing paren of a FROM suffix)
+     * So BOTH boundaries are word boundaries `\b`, not `\s`: `\b` matches the edge
+     * between the keyword and ANY non-word char (space, `` ` ``, `(`, `)`, `,`) or the
+     * string end, closing the whole separator class in one rule rather than patching
+     * one character at a time.
+     *
+     * Back-ticks are still replaced with spaces first (a back-ticked column in the
+     * tail is then scanned as a bare identifier), and GROUP/ORDER require their `BY`,
+     * so a back-ticked table named after a clause keyword (`` `order` ``) is not read
+     * as one. WHERE/HAVING have no BY; a table literally named `where` would only
+     * widen the scanned tail (deny-on-doubt, never narrower).
+     *
+     * Operates on comment/string-stripped SQL, so a literal like
+     * `WHERE note = 'order by x'` is not mistaken for a clause. LIMIT / OFFSET are
+     * excluded: enforceLimit guarantees they carry only integers.
+     */
+    /**
+     * Reject any subquery `(SELECT …)` anywhere in the SQL. A subquery in FROM carries
+     * its own uninspected projection (`FROM (SELECT password AS x …) t` renames PII past
+     * the masker); a subquery in a WHERE fragment queries ANOTHER table, but the oracle
+     * guard resolves masking under the OUTER/counted table, so a per-table masked column
+     * (`customers.name` inside a subquery over `orders`) slips past and the row count
+     * becomes an oracle for it. Both read_query (via guardProjection) and count_rows
+     * (whose user WHERE fragment could smuggle one) share this. Scans string-literal-
+     * stripped SQL, so a literal `'(select …)'` value does not trip it.
+     */
+    public function assertNoSubquery(string $sql): void
+    {
+        if (preg_match('/\(\s*select\b/', $this->normalize($sql)) === 1) {
+            throw new QueryGuardException('Subqueries are not allowed; query one table at a time.');
+        }
+    }
+
+    public function filterClauses(string $sql): string
+    {
+        $lower = $this->normalize($sql, neutralizeBackticks: true);
+
+        if (preg_match('/\b(where|having|group\s+by|order\s+by)\b.*$/s', $lower, $m) === 1) {
+            return trim($m[0]);
+        }
+
+        return '';
+    }
+
+    /**
+     * The projection of a `SELECT DISTINCT …` (the DISTINCT modifier stripped), or
+     * null when the query is not DISTINCT. DISTINCT deduplicates rows by the REAL
+     * column value before masking, so a masked column in a DISTINCT projection is a
+     * cardinality oracle: `SELECT DISTINCT password FROM users` returns one row per
+     * distinct secret, so row_count leaks how many distinct values exist (and, filtered
+     * by a non-masked WHERE, their distribution). This is the same leak that
+     * `GROUP BY <masked>` already refuses via filterClauses — DISTINCT is the sister
+     * path, so read_query scans this projection through the oracle guard too. A plain
+     * (non-DISTINCT) projection is safe: row_count is the table size, independent of
+     * the masked value, and each row is masked individually.
+     */
+    public function distinctProjection(string $sql): ?string
+    {
+        $lower = $this->normalize($sql);
+
+        if (! str_starts_with($lower, 'select ')) {
+            return null;
+        }
+
+        $projection = trim($this->extractProjection($lower));
+
+        if (preg_match('/^distinct\b\s*/', $projection) !== 1) {
+            return null;
+        }
+
+        return (string) preg_replace('/^distinct\b\s*/', '', $projection);
+    }
+
+    /**
+     * True when an ORDER BY / GROUP BY sorts by a projection POSITION (`ORDER BY 2`)
+     * instead of a column name. A positional reference names no column, so the
+     * name-based oracle guard (firstMaskedIdentifier scans identifiers, not digits)
+     * cannot see it — yet MySQL still orders/groups by the real, possibly masked
+     * column, leaking its ordering. read_query refuses positional sorts
+     * (deny-on-doubt); sort by an explicit column name, which the oracle guard can
+     * vet. Operates on the same normalized, back-tick-neutralised SQL as
+     * filterClauses. Each ORDER/GROUP BY clause is isolated up to the next clause
+     * keyword (so a `LIMIT 2` is never mistaken for a position), split on commas,
+     * and any bare-integer term (optionally ASC/DESC) trips it.
+     */
+    public function hasPositionalSort(string $sql): bool
+    {
+        $lower = $this->normalize($sql, neutralizeBackticks: true);
+
+        if (preg_match_all(
+            '/\b(?:order|group)\s+by\s+(.+?)(?=\s+(?:where|having|order\s+by|group\s+by|limit|offset|for|into|window)\b|$)/',
+            $lower,
+            $clauses
+        ) === 0) {
+            return false;
+        }
+
+        foreach ($clauses[1] as $clause) {
+            foreach (explode(',', $clause) as $term) {
+                $term = trim((string) preg_replace('/\s+(asc|desc)$/', '', trim($term)));
+
+                if ($term !== '' && ctype_digit($term)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -306,10 +434,7 @@ class QueryGuard
      */
     public function singleTableFrom(string $sql): ?string
     {
-        $lower = strtolower((string) preg_replace(
-            '/\s+/', ' ',
-            $this->stripStringLiterals(trim($this->stripComments($sql)))
-        ));
+        $lower = $this->normalize($sql);
 
         // Only a plain SELECT surfaces row data that maskRow() will process.
         if (! str_starts_with($lower, 'select ')) {
@@ -421,6 +546,25 @@ class QueryGuard
         if (str_contains($rawSql, '/*!')) {
             throw new QueryGuardException('MySQL executable comments are not allowed in read_query.');
         }
+    }
+
+    /**
+     * The shared normal form the clause/projection scanners read: comments stripped,
+     * string literals blanked, whitespace collapsed to single spaces, lower-cased.
+     * `$neutralizeBackticks` additionally turns back-ticks into spaces so a keyword
+     * abutting a closing back-tick (`` `t`WHERE ``) is still delimited — needed by the
+     * clause matchers (filterClauses / hasPositionalSort), not by the ones that only
+     * read the first identifier (guardProjection / singleTableFrom / distinctProjection).
+     */
+    private function normalize(string $sql, bool $neutralizeBackticks = false): string
+    {
+        $cleaned = $this->stripStringLiterals(trim($this->stripComments($sql)));
+
+        if ($neutralizeBackticks) {
+            $cleaned = str_replace('`', ' ', $cleaned);
+        }
+
+        return strtolower((string) preg_replace('/\s+/', ' ', $cleaned));
     }
 
     private function stripComments(string $sql): string

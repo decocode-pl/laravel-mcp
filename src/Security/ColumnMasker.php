@@ -111,6 +111,39 @@ class ColumnMasker
         return false;
     }
 
+    /**
+     * The first identifier in a raw SQL fragment that names a masked column, or
+     * null if none do. Backs the filter/sort oracle guards: filtering or ordering
+     * on a masked column (`WHERE api_token LIKE 'ab%'`, `ORDER BY pesel`) turns the
+     * result into an existence oracle for that value, extractable bit-by-bit even
+     * though the column is redacted in the projection.
+     *
+     * Scans bare word tokens; the caller must pass a fragment with string literals
+     * already stripped (so a value like `WHERE note = 'pesel'` is not mistaken for
+     * the column). `$table` carries the source table so per-table masking
+     * (customers.name) is honoured — pass the same table used for maskRow().
+     */
+    public function firstMaskedIdentifier(string $fragment, ?string $table = null): ?string
+    {
+        if (trim($fragment) === '') {
+            return null;
+        }
+
+        // Token = any run of identifier chars, INCLUDING a leading digit: a back-ticked
+        // column may legally start with one (`` `2fa_secret` ``), and dropping the digit
+        // would miss an exact-match masking pattern. Bare numbers are scanned too but
+        // never match a column name, so they are harmless noise.
+        preg_match_all('/[a-z0-9_]+/i', $fragment, $identifiers);
+
+        foreach (array_unique($identifiers[0]) as $identifier) {
+            if ($this->shouldMask($identifier, $table)) {
+                return $identifier;
+            }
+        }
+
+        return null;
+    }
+
     public function maskValue(string $column, mixed $value, ?string $table = null): mixed
     {
         if ($value === null || ! $this->shouldMask($column, $table)) {

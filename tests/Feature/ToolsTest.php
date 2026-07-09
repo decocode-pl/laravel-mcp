@@ -155,6 +155,154 @@ it('read_query refuses a function-wrapped projection that could rename PII', fun
     expect($response->isError())->toBeTrue();
 });
 
+it('read_query refuses a WHERE that references a masked column (oracle guard)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // `WHERE email LIKE 'a%'` would be an existence oracle: the projection redacts
+    // email, but the row set reveals whether any value starts with 'a', extractable
+    // bit-by-bit. Must be refused before the query runs.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => "SELECT id FROM customers WHERE email LIKE 'a%'",
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('masked column [email]');
+});
+
+it('read_query refuses ORDER BY on a masked column (order oracle)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // Ordering by a masked column leaks its sort order (a partial oracle), so the
+    // filter/sort tail — not just WHERE — is guarded.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT id FROM customers ORDER BY password',
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('masked column [password]');
+});
+
+it('read_query honours per-table masking in the oracle guard', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // `name` is not globally masked, but a table pattern makes it PII in customers.
+    // The guard must resolve the source table and refuse a WHERE on it there.
+    config()->set('mcp.masking.table_patterns', ['customers' => ['name']]);
+
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => "SELECT id FROM customers WHERE name = 'Jan'",
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('masked column [name]');
+});
+
+it('read_query allows a WHERE on non-masked columns', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // Filtering on ordinary columns (id) stays fully functional.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT id, name FROM customers WHERE id = 1',
+    ]);
+
+    expect($response->isError())->toBeFalse();
+    $payload = json_decode((string) $response->content(), true);
+    expect($payload['row_count'])->toBe(1);
+});
+
+it('read_query refuses SELECT DISTINCT on a masked column (cardinality oracle)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // DISTINCT dedups by the real value before masking, so row_count would reveal how
+    // many distinct passwords exist — the sister leak of GROUP BY on a masked column.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT DISTINCT password FROM customers',
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('DISTINCT on the masked column [password]');
+});
+
+it('read_query allows SELECT DISTINCT on a non-masked column', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT DISTINCT name FROM customers',
+    ]);
+
+    expect($response->isError())->toBeFalse();
+});
+
+it('read_query refuses SELECT DISTINCT * (dedups on masked column values)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // `*` is not a scannable name, but DISTINCT * dedups on the whole row — including
+    // password's real value — so row_count leaks its cardinality. Must be refused.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT DISTINCT * FROM customers',
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('DISTINCT * is not allowed');
+});
+
+it('read_query refuses a positional ORDER BY (masked column by position)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // `ORDER BY 2` sorts by the 2nd projection column (password) without naming it,
+    // so a name scan cannot see it — but MySQL still orders by the masked value.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT id, password FROM customers ORDER BY 2',
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('column position');
+});
+
+it('read_query allows ORDER BY on a non-masked column by name', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => 'SELECT id, name FROM customers ORDER BY id',
+    ]);
+
+    expect($response->isError())->toBeFalse();
+});
+
+it('read_query rejects a subquery in WHERE (table-context oracle)', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // A subquery in WHERE queries another table; the oracle guard resolves masking
+    // under the OUTER table, so a per-table masked column referenced inside would
+    // slip past. Rejected outright — a single-table tool needs no subqueries.
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => "SELECT id FROM customers WHERE id IN (SELECT id FROM customers WHERE password LIKE 'a%')",
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('Subqueries are not allowed');
+});
+
+it('read_query rejects a cross-table subquery oracle on a per-table masked column', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // `name` is masked only in customers. Without the subquery ban, this filters
+    // orders by whether a customer name matches — an oracle for customers.name,
+    // because the guard would resolve masking under `orders` (the outer table).
+    config()->set('mcp.masking.table_patterns', ['customers' => ['name']]);
+    Schema::connection('mcp_ro')->create('orders', function ($table): void {
+        $table->integer('id');
+        $table->integer('customer_id');
+    });
+
+    $response = callTool(app(ReadQueryTool::class), [
+        'sql' => "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE name LIKE 'Kowalsk%')",
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('Subqueries are not allowed');
+});
+
 it('read_query records a fail-closed audit row', function () {
     test()->actingAs(readAccount(), 'mcp');
 
@@ -169,11 +317,14 @@ it('read_query reports a DB error without leaking a WHERE literal (0.3.2 DX)', f
     test()->actingAs(readAccount(), 'mcp');
 
     // A query that parses and passes the guard but the database rejects, with a
-    // would-be-PII literal in the WHERE. On SQLite an unknown column is HY000, so
-    // the reason collapses to the generic message (the verbatim structural error is
-    // MySQL-only — see DatabaseErrorReasonTest). Either way, nothing may leak.
+    // would-be-PII literal in the WHERE. The filter is on `name` (not masked here —
+    // no table pattern set in this test): the oracle guard now refuses a WHERE on a
+    // masked column (email) BEFORE the query runs, so a masked column can no longer
+    // reach the DB-error path. On SQLite an unknown column is HY000, so the reason
+    // collapses to the generic message (the verbatim structural error is MySQL-only
+    // — see DatabaseErrorReasonTest). Either way, nothing may leak.
     $response = callTool(app(ReadQueryTool::class), [
-        'sql' => "SELECT payer FROM customers WHERE email = 'leaked-pii@example.com'",
+        'sql' => "SELECT payer FROM customers WHERE name = 'leaked-pii@example.com'",
     ]);
 
     expect($response->isError())->toBeTrue();
@@ -297,6 +448,39 @@ it('count_rows refuses a WHERE that references a masked column (oracle guard)', 
 
     expect($response->isError())->toBeTrue();
 });
+
+it('count_rows refuses a cross-table subquery oracle on a per-table masked column', function () {
+    test()->actingAs(readAccount(), 'mcp');
+
+    // `name` is masked only in customers. count_rows resolves masking under the counted
+    // table (orders), so without the subquery ban a subquery over customers would be an
+    // oracle for customers.name via the count.
+    config()->set('mcp.masking.table_patterns', ['customers' => ['name']]);
+    Schema::connection('mcp_ro')->create('orders', function ($table): void {
+        $table->integer('id');
+        $table->integer('customer_id');
+    });
+
+    $response = callTool(app(CountRowsTool::class), [
+        'table' => 'orders',
+        'where' => "customer_id IN (SELECT id FROM customers WHERE name LIKE 'Sm%')",
+    ]);
+
+    expect($response->isError())->toBeTrue();
+    expect((string) $response->content())->toContain('Subqueries are not allowed');
+});
+
+it('count_rows refuses injected GROUP BY / ORDER BY in the WHERE fragment', function (string $where) {
+    test()->actingAs(readAccount(), 'mcp');
+
+    $response = callTool(app(CountRowsTool::class), ['table' => 'customers', 'where' => $where]);
+
+    expect($response->isError())->toBeTrue();
+})->with([
+    'group by masked' => ['1=1 GROUP BY password'],
+    'order by masked' => ['1=1 ORDER BY password'],
+    'having'          => ['1=1 HAVING count(*) > 5'],
+]);
 
 it('schema.describe flags masked columns and never returns values', function () {
     test()->actingAs(readAccount(), 'mcp');

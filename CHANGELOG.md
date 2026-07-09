@@ -3,6 +3,58 @@
 All notable changes to `decocode/laravel-mcp` are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.3] - 2026-07-09
+
+### Fixed — `read_query` closes the WHERE/ORDER-BY oracle on masked columns (PR-001)
+- Masking redacts a column in the **projection**, but `read_query` placed no guard on the filter/sort
+  clauses — so `SELECT id FROM t WHERE api_token LIKE 'ab%'` (or `ORDER BY pesel`) turned the returned
+  row set into an **existence/order oracle**, letting a caller reconstruct a masked value bit-by-bit even
+  though it is never displayed. `count_rows` already blocked this on its WHERE fragment; `read_query` now
+  applies the same guard to its whole filter/sort tail (WHERE / GROUP BY / HAVING / ORDER BY), refusing any
+  reference to a masked column **before** the query runs. Uses the same resolved source table as row
+  masking, so per-table rules (e.g. `customers.name`) are honoured; filtering on ordinary columns
+  (id, status, timestamps) is unaffected.
+- The oracle affected any column masked only in output — notably live credentials like `api_token` and
+  `remember_token`, which many apps do not shield with a column-level DB grant. Found by holistic pr-review
+  during a field deployment, confirmed e2e; the fix protects every deployment at once.
+- Shared helper `ColumnMasker::firstMaskedIdentifier()` backs both tools (DRY); `QueryGuard::filterClauses()`
+  isolates the tail. Tests: oracle refusal (WHERE/ORDER/GROUP/HAVING, per-table), non-masked filters still
+  work, plus unit coverage for both helpers.
+
+### Also in read_query — closing the same oracle class through other references
+Adversarial re-audit of the guard above surfaced three further ways a masked column could influence the
+result without being caught by a plain name scan; all are now refused before execution:
+- **Positional sort** — `ORDER BY 2` / `GROUP BY 2` names no column, so a name scan can't see it, yet MySQL
+  still orders by that (possibly masked) projection column. `QueryGuard::hasPositionalSort()` rejects bare
+  integer sort terms; sort by an explicit column name instead.
+- **No-space clause boundaries** — `WHERE(email …)` (no space after the keyword) and `` `t`WHERE … `` (no
+  space before it, after a closing back-tick) both once produced an empty scanned tail. `filterClauses()`
+  now uses a `\b` boundary and neutralises back-ticks; `GROUP`/`ORDER` require their `BY` so a back-ticked
+  table named after a clause keyword is not mistaken for one.
+- **Subqueries** — a subquery in WHERE queries another table, but the guard resolves masking under the outer
+  table, so a per-table masked column (`customers.name`) referenced in a subquery over another table slipped
+  past. `read_query` is a single-table tool: `guardProjection` now rejects every `(SELECT …)` (like it
+  already rejected subqueries in FROM). Trade-off: no subqueries in WHERE — run the inner query on its own.
+- **Window functions** — `WINDOW w AS (PARTITION BY password) ORDER BY SUM(id) OVER w` orders/partitions
+  rows by a masked value from a region outside the scanned tail. `guardProjection` now rejects `OVER` /
+  `WINDOW` outright (deny-on-doubt) — read_query needs no window analytics.
+- **SELECT DISTINCT on a masked column** — DISTINCT dedups by the real value before masking, so `row_count`
+  leaks the column's cardinality (the sister leak of `GROUP BY <masked>`, already refused). The oracle guard
+  now scans the DISTINCT projection too, and `DISTINCT *` / `DISTINCT t.*` (which dedups on the whole row,
+  masked columns included, without naming them) is refused outright.
+
+  Every region where a column can influence the result set — projection (incl. DISTINCT and `*`),
+  WHERE/HAVING/GROUP BY/ORDER BY, and window/partition clauses — is now guarded or refused; several rounds
+  of adversarial re-audit drove these out.
+
+### count_rows — same oracle closed on its WHERE fragment
+`count_rows` accepts a user WHERE fragment and had the sister leak: a cross-table subquery
+(`count_rows(orders, "customer_id IN (SELECT id FROM customers WHERE name LIKE 'a%')")`) is an oracle for a
+per-table masked column (`customers.name`), since masking there is resolved under the counted table. The
+shared `QueryGuard::assertNoSubquery()` now rejects any `(SELECT …)` in the fragment, and an injected
+`GROUP BY` / `ORDER BY` / `HAVING` / set operation is refused too — the fragment must be a plain boolean
+condition. Both tools now enforce the same rule.
+
 ## [0.3.2] - 2026-07-08
 
 ### Improved — diagnostic tools now surface the real reason a query failed

@@ -82,27 +82,31 @@ class CountRowsTool extends AbstractDiagnosticTool
             throw new QueryGuardException("Table [{$table}] is blocked from MCP access.");
         }
 
-        // Reject set operations in the WHERE fragment — they would append another
-        // query to the count (harmless here, but inconsistent with read_query and
-        // an unnecessary surface). Strip single-quoted literals first so a value
-        // like 'union dues' is not mistaken for the keyword.
+        // The `where` is meant to be a boolean condition, not a place to smuggle extra
+        // clauses. Strip single-quoted literals first so a value like 'union dues' /
+        // 'order by phone' is not mistaken for a keyword. Reject set operations and any
+        // injected GROUP BY / ORDER BY / HAVING: each would turn the count into a
+        // grouping/ordering oracle over a masked column (the sister of read_query's tail
+        // guard) instead of a plain filtered count.
         $whereScan = (string) preg_replace('/\'(?:[^\'\\\\]|\\\\.)*\'/', "''", $where);
-        if ($where !== '' && preg_match('/\b(union|intersect|except)\b/i', $whereScan) === 1) {
-            throw new QueryGuardException('Set operations are not allowed in the WHERE condition.');
+        if ($where !== '' && preg_match('/\b(union|intersect|except|group\s+by|order\s+by|having)\b/i', $whereScan) === 1) {
+            throw new QueryGuardException('The WHERE condition may only be a boolean expression (no set operations, GROUP BY, ORDER BY or HAVING).');
+        }
+
+        // A subquery in the fragment queries another table; masking here is resolved
+        // under the COUNTED table, so a per-table masked column inside it (e.g.
+        // `customers.name` in a subquery over `orders`) would slip past the check below
+        // and the count becomes an oracle for it. Same guard read_query applies.
+        if ($where !== '') {
+            $this->guard->assertNoSubquery("SELECT 1 WHERE {$where}");
         }
 
         // A count filtered on a masked column would be an existence oracle for
         // that PII (`WHERE pesel LIKE '44%'`). Refuse any masked-column reference.
-        if ($where !== '') {
-            preg_match_all('/[a-z_][a-z0-9_]*/i', $whereScan, $identifiers);
-
-            foreach (array_unique($identifiers[0]) as $identifier) {
-                // Table-qualified (0.3.0): the counted table is known, so the
-                // oracle guard honours per-table masking too.
-                if ($this->masker->shouldMask($identifier, $table)) {
-                    throw new QueryGuardException("The WHERE condition may not reference the masked column [{$identifier}].");
-                }
-            }
+        // Table-qualified (0.3.0): the counted table is known, so per-table masking
+        // is honoured too. read_query applies the same guard to its filter/sort tail.
+        if (($maskedRef = $this->masker->firstMaskedIdentifier($whereScan, $table)) !== null) {
+            throw new QueryGuardException("The WHERE condition may not reference the masked column [{$maskedRef}].");
         }
 
         $sql = "SELECT COUNT(*) AS aggregate FROM `{$table}`"
